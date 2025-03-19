@@ -1,0 +1,9 @@
+{
+  "app": "npx ts-node --prefer-ts-exts bin/image-optimization.ts",
+  "context": {
+    "S3_IMAGE_BUCKET_NAME": "geerly-cms-content",
+    "STORE_TRANSFORMED_IMAGES": "true",
+    "S3_TRANSFORMED_IMAGE_EXPIRATION_DURATION": "90",
+    "CLOUDFRONT_CORS_ENABLED": "true"
+  }
+} 
