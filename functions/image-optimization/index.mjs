@@ -10,67 +10,83 @@ const S3_TRANSFORMED_IMAGE_BUCKET = process.env.transformedImageBucketName;
 const TRANSFORMED_IMAGE_CACHE_TTL = process.env.transformedImageCacheTTL;
 const MAX_IMAGE_SIZE = parseInt(process.env.maxImageSize);
 
-function sendError(statusCode, body, error) {
-    logError(body, error);
-    return { statusCode, body };
-}
-
-function logError(body, error) {
-    console.log('APPLICATION ERROR', body);
-    console.log(error);
-}
-
 export const handler = async (event) => {
     // Validate if this is a GET request
     if (!event.requestContext || !event.requestContext.http || !(event.requestContext.http.method === 'GET')) return sendError(400, 'Only GET method is supported', event);
+
+    // Log the incoming request details
+    console.log('Incoming request headers:', JSON.stringify(event.headers, null, 2));
+    console.log('Incoming request context:', JSON.stringify(event.requestContext, null, 2));
+    console.log('Incoming request path:', event.requestContext.http.path);
 
     // Verify request comes from CloudFront
     if (!event.headers || event.headers['x-origin-verify'] !== 'cloudfront') {
         return sendError(403, 'Unauthorized', 'Request not from CloudFront');
     }
 
-    // An example of expected path is /images/rio/1.jpeg/format=auto,width=100 or /images/rio/1.jpeg/original where /images/rio/1.jpeg is the path of the original image
-    var imagePathArray = event.requestContext.http.path.split('/');
-    // get the requested image operations
-    var operationsPrefix = imagePathArray.pop();
-    // get the original image path images/rio/1.jpg
-    imagePathArray.shift();
-    var originalImagePath = imagePathArray.join('/');
+    // Validate and extract path
+    const path = event.requestContext.http.path;
+    if (!path || path === '/') {
+        return sendError(400, 'Invalid request: no image path provided', null);
+    }
+
+    // Remove leading slash and split path
+    const pathParts = path.substring(1).split('/');
+    if (pathParts.length < 1) {
+        return sendError(400, 'Invalid request: malformed image path', null);
+    }
+
+    // The last part might be operations
+    let operations = {};
+    let imagePath = pathParts.join('/');
+
+    // Check if the last part contains operations
+    if (pathParts[pathParts.length - 1].includes('=')) {
+        const operationsString = pathParts.pop();
+        imagePath = pathParts.join('/');
+        try {
+            operations = Object.fromEntries(operationsString.split(',').map(operation => operation.split('=')));
+        } catch (error) {
+            return sendError(400, 'Invalid operations format', error);
+        }
+    }
+
+    // Validate image path exists
+    if (!imagePath) {
+        return sendError(400, 'Invalid request: no image path after operations', null);
+    }
 
     var startTime = performance.now();
     // Downloading original image
     let originalImageBody;
     let contentType;
     try {
-        const getOriginalImageCommand = new GetObjectCommand({ Bucket: S3_ORIGINAL_IMAGE_BUCKET, Key: originalImagePath });
+        const getOriginalImageCommand = new GetObjectCommand({ Bucket: S3_ORIGINAL_IMAGE_BUCKET, Key: imagePath });
         const getOriginalImageCommandOutput = await s3Client.send(getOriginalImageCommand);
-        console.log(`Got response from S3 for ${originalImagePath}`);
+        console.log(`Got response from S3 for ${imagePath}`);
 
         originalImageBody = getOriginalImageCommandOutput.Body.transformToByteArray();
         contentType = getOriginalImageCommandOutput.ContentType;
     } catch (error) {
-        return sendError(500, 'Error downloading original image', error);
+        return sendError(404, `Image not found: ${imagePath}`, error);
     }
     let transformedImage = Sharp(await originalImageBody, { failOn: 'none', animated: true });
     // Get image orientation to rotate if needed
     const imageMetadata = await transformedImage.metadata();
     // execute the requested operations 
-    const operationsJSON = Object.fromEntries(operationsPrefix.split(',').map(operation => operation.split('=')));
-    // variable holding the server timing header value
-    var timingLog = 'img-download;dur=' + parseInt(performance.now() - startTime);
     startTime = performance.now();
     try {
         // check if resizing is requested
         var resizingOptions = {};
-        if (operationsJSON['width']) resizingOptions.width = parseInt(operationsJSON['width']);
-        if (operationsJSON['height']) resizingOptions.height = parseInt(operationsJSON['height']);
+        if (operations['width']) resizingOptions.width = parseInt(operations['width']);
+        if (operations['height']) resizingOptions.height = parseInt(operations['height']);
         if (resizingOptions) transformedImage = transformedImage.resize(resizingOptions);
         // check if rotation is needed
         if (imageMetadata.orientation) transformedImage = transformedImage.rotate();
         // check if formatting is requested
-        if (operationsJSON['format']) {
+        if (operations['format']) {
             var isLossy = false;
-            switch (operationsJSON['format']) {
+            switch (operations['format']) {
                 case 'jpeg': contentType = 'image/jpeg'; isLossy = true; break;
                 case 'gif': contentType = 'image/gif'; break;
                 case 'webp': contentType = 'image/webp'; isLossy = true; break;
@@ -78,11 +94,11 @@ export const handler = async (event) => {
                 case 'avif': contentType = 'image/avif'; isLossy = true; break;
                 default: contentType = 'image/jpeg'; isLossy = true;
             }
-            if (operationsJSON['quality'] && isLossy) {
-                transformedImage = transformedImage.toFormat(operationsJSON['format'], {
-                    quality: parseInt(operationsJSON['quality']),
+            if (operations['quality'] && isLossy) {
+                transformedImage = transformedImage.toFormat(operations['format'], {
+                    quality: parseInt(operations['quality']),
                 });
-            } else transformedImage = transformedImage.toFormat(operationsJSON['format']);
+            } else transformedImage = transformedImage.toFormat(operations['format']);
         } else {
             /// If not format is precised, Sharp converts svg to png by default https://github.com/aws-samples/image-optimization/issues/48
             if (contentType === 'image/svg+xml') contentType = 'image/png';
@@ -91,7 +107,7 @@ export const handler = async (event) => {
     } catch (error) {
         return sendError(500, 'error transforming image', error);
     }
-    timingLog = timingLog + ',img-transform;dur=' + parseInt(performance.now() - startTime);
+    let timingLog = 'img-download;dur=' + parseInt(performance.now() - startTime);
 
     // handle gracefully generated images bigger than a specified limit (e.g. Lambda output object limit)
     const imageTooBig = Buffer.byteLength(transformedImage) > MAX_IMAGE_SIZE;
@@ -103,7 +119,7 @@ export const handler = async (event) => {
             const putImageCommand = new PutObjectCommand({
                 Body: transformedImage,
                 Bucket: S3_TRANSFORMED_IMAGE_BUCKET,
-                Key: originalImagePath + '/' + operationsPrefix,
+                Key: imagePath + '/' + Object.entries(operations).map(([k, v]) => `${k}=${v}`).join(','),
                 ContentType: contentType,
                 CacheControl: TRANSFORMED_IMAGE_CACHE_TTL,
             })
@@ -114,7 +130,7 @@ export const handler = async (event) => {
                 return {
                     statusCode: 302,
                     headers: {
-                        'Location': '/' + originalImagePath + '?' + operationsPrefix.replace(/,/g, "&"),
+                        'Location': '/' + imagePath + '?' + Object.entries(operations).map(([k, v]) => `${k}=${v}`).join(','),
                         'Cache-Control': 'private,no-store',
                         'Server-Timing': timingLog
                     }
@@ -139,3 +155,19 @@ export const handler = async (event) => {
         }
     };
 };
+function sendError(statusCode, body, error) {
+    logError(body, error);
+    return { 
+        statusCode, 
+        body: JSON.stringify({
+            message: body || 'An error occurred',
+            error: error?.message || error || 'Unknown error'
+        })
+    };
+}
+
+function logError(body, error) {
+    console.error('APPLICATION ERROR:', body);
+    console.error('Error details:', error);
+}
+

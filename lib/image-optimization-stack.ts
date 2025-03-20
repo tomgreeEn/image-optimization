@@ -1,359 +1,179 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT-0
 
-import { Fn, Stack, StackProps, RemovalPolicy, aws_s3 as s3, aws_s3_deployment as s3deploy, aws_cloudfront as cloudfront, aws_cloudfront_origins as origins, aws_lambda as lambda, aws_iam as iam, Duration, CfnOutput, aws_logs as logs, aws_certificatemanager as acm } from 'aws-cdk-lib';
-import { CfnDistribution } from "aws-cdk-lib/aws-cloudfront";
+import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
-import { getOriginShieldRegion } from './origin-shield';
-import { createHash } from 'crypto';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
+import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import { Duration } from 'aws-cdk-lib';
 import { FFmpegLayer } from './ffmpeg-layer';
+import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 
-// Stack Parameters
+// Environment variables
+const LAMBDA_MEMORY = process.env.LAMBDA_MEMORY || '2048';
+const LAMBDA_TIMEOUT = process.env.LAMBDA_TIMEOUT || '30';
+const ORIGINAL_IMAGE_BUCKET = process.env.ORIGINAL_IMAGE_BUCKET || 'geerly-cms-content';
+const TRANSFORMED_IMAGE_CACHE_TTL = process.env.TRANSFORMED_IMAGE_CACHE_TTL || 'public, max-age=31536000';
+const MAX_IMAGE_SIZE = process.env.MAX_IMAGE_SIZE || '10485760';
+const THUMBNAIL_CACHE_TTL = process.env.THUMBNAIL_CACHE_TTL || 'public, max-age=31536000';
 
-// related to architecture. If set to false, transformed images are not stored in S3, and all image requests land on Lambda
-var STORE_TRANSFORMED_IMAGES = 'true';
-// Parameters of S3 bucket where original images are stored
-var S3_IMAGE_BUCKET_NAME: string;
-// CloudFront parameters
-var CLOUDFRONT_ORIGIN_SHIELD_REGION = getOriginShieldRegion(process.env.AWS_REGION || process.env.CDK_DEFAULT_REGION || 'us-east-1');
-var CLOUDFRONT_CORS_ENABLED = 'true';
-// Parameters of transformed images
-var S3_TRANSFORMED_IMAGE_EXPIRATION_DURATION = '90';
-var S3_TRANSFORMED_IMAGE_CACHE_TTL = 'max-age=31622400';
-// Max image size in bytes. If generated images are stored on S3, bigger images are generated, stored on S3
-// and request is redirect to the generated image. Otherwise, an application error is sent.
-var MAX_IMAGE_SIZE = '4700000';
-// Lambda Parameters
-var LAMBDA_MEMORY = '1500';
-var LAMBDA_TIMEOUT = '60';
-// Whether to deploy a sample website referenced in https://aws.amazon.com/blogs/networking-and-content-delivery/image-optimization-using-amazon-cloudfront-and-aws-lambda/
-var DEPLOY_SAMPLE_WEBSITE = 'false';
+// Certificate ARNs
+const GEERLY_CERTIFICATE_ARN = 'arn:aws:acm:us-east-1:656044625343:certificate/b271caf9-020e-4de3-9ad4-b24e596e8b00';
+const BOILINGKETTLE_CERTIFICATE_ARN = 'arn:aws:acm:us-east-1:656044625343:certificate/90d4ad1c-19c1-4c6a-84a7-7b1812831b91';
 
-type ImageDeliveryCacheBehaviorConfig = {
-  origin: any;
-  compress: any;
-  viewerProtocolPolicy: any;
-  cachePolicy: any;
-  functionAssociations: any;
-  responseHeadersPolicy?: any;
-};
-
-type LambdaEnv = {
-  originalImageBucketName: string,
-  transformedImageBucketName?: any;
-  transformedImageCacheTTL: string,
-  maxImageSize: string,
-}
-
-export class ImageOptimizationStack extends Stack {
-  constructor(scope: Construct, id: string, props?: StackProps) {
+export class ImgTransformationStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // Change stack parameters based on provided context
-    STORE_TRANSFORMED_IMAGES = this.node.tryGetContext('STORE_TRANSFORMED_IMAGES') || STORE_TRANSFORMED_IMAGES;
-    S3_TRANSFORMED_IMAGE_EXPIRATION_DURATION = this.node.tryGetContext('S3_TRANSFORMED_IMAGE_EXPIRATION_DURATION') || S3_TRANSFORMED_IMAGE_EXPIRATION_DURATION;
-    S3_TRANSFORMED_IMAGE_CACHE_TTL = this.node.tryGetContext('S3_TRANSFORMED_IMAGE_CACHE_TTL') || S3_TRANSFORMED_IMAGE_CACHE_TTL;
-    S3_IMAGE_BUCKET_NAME = this.node.tryGetContext('S3_IMAGE_BUCKET_NAME') || S3_IMAGE_BUCKET_NAME;
-    CLOUDFRONT_ORIGIN_SHIELD_REGION = this.node.tryGetContext('CLOUDFRONT_ORIGIN_SHIELD_REGION') || CLOUDFRONT_ORIGIN_SHIELD_REGION;
-    CLOUDFRONT_CORS_ENABLED = this.node.tryGetContext('CLOUDFRONT_CORS_ENABLED') || CLOUDFRONT_CORS_ENABLED;
-    LAMBDA_MEMORY = this.node.tryGetContext('LAMBDA_MEMORY') || LAMBDA_MEMORY;
-    LAMBDA_TIMEOUT = this.node.tryGetContext('LAMBDA_TIMEOUT') || LAMBDA_TIMEOUT;
-    MAX_IMAGE_SIZE = this.node.tryGetContext('MAX_IMAGE_SIZE') || MAX_IMAGE_SIZE;
-    DEPLOY_SAMPLE_WEBSITE = this.node.tryGetContext('DEPLOY_SAMPLE_WEBSITE') || DEPLOY_SAMPLE_WEBSITE;
-    
-
-    // deploy a sample website for testing if required
-    if (DEPLOY_SAMPLE_WEBSITE === 'true') {
-      var sampleWebsiteBucket = new s3.Bucket(this, 's3-sample-website-bucket', {
-        removalPolicy: RemovalPolicy.DESTROY,
-        blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-        encryption: s3.BucketEncryption.S3_MANAGED,
-        enforceSSL: true,
-        autoDeleteObjects: true,
-      });
-
-      var sampleWebsiteDelivery = new cloudfront.Distribution(this, 'websiteDeliveryDistribution', {
-        comment: 'image optimization - sample website',
-        defaultRootObject: 'index.html',
-        defaultBehavior: {
-          origin: new origins.S3Origin(sampleWebsiteBucket),
-          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-        }
-      });
-
-      new CfnOutput(this, 'SampleWebsiteDomain', {
-        description: 'Sample website domain',
-        value: sampleWebsiteDelivery.distributionDomainName
-      });
-      new CfnOutput(this, 'SampleWebsiteS3Bucket', {
-        description: 'S3 bucket use by the sample website',
-        value: sampleWebsiteBucket.bucketName
-      });
-    }
-
-    // For the bucket having original images, either use an external one, or create one with some samples photos.
-    var originalImageBucket;
-    var transformedImageBucket;
-    
-    if (S3_IMAGE_BUCKET_NAME) {
-      originalImageBucket = s3.Bucket.fromBucketName(this, 'imported-original-image-bucket', S3_IMAGE_BUCKET_NAME);
-      new CfnOutput(this, 'OriginalImagesS3Bucket', {
-        description: 'S3 bucket where original images are stored',
-        value: originalImageBucket.bucketName
-      });
-    } else {
-      originalImageBucket = new s3.Bucket(this, 's3-sample-original-image-bucket', {
-        removalPolicy: RemovalPolicy.DESTROY,
-        blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-        encryption: s3.BucketEncryption.S3_MANAGED,
-        enforceSSL: true,
-        autoDeleteObjects: true,
-      });
-      new s3deploy.BucketDeployment(this, 'DeployWebsite', {
-        sources: [s3deploy.Source.asset('./image-sample')],
-        destinationBucket: originalImageBucket,
-        destinationKeyPrefix: 'images/rio/',
-      });
-      new CfnOutput(this, 'OriginalImagesS3Bucket', {
-        description: 'S3 bucket where original images are stored',
-        value: originalImageBucket.bucketName
-      });
-    }
-
-    // create bucket for transformed images if enabled in the architecture
-    if (STORE_TRANSFORMED_IMAGES === 'true') {
-      transformedImageBucket = new s3.Bucket(this, 's3-transformed-image-bucket', {
-        removalPolicy: RemovalPolicy.DESTROY,
-        autoDeleteObjects: true,
+    // Create S3 bucket for transformed images
+    const s3ThumbnailBucket = new s3.Bucket(this, 'S3ThumbnailBucket', {
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      autoDeleteObjects: false,
         lifecycleRules: [
           {
-            expiration: Duration.days(parseInt(S3_TRANSFORMED_IMAGE_EXPIRATION_DURATION)),
-          },
-        ],
-      });
-    }
-
-    // prepare env variable for Lambda 
-    var lambdaEnv: LambdaEnv = {
-      originalImageBucketName: originalImageBucket.bucketName,
-      transformedImageCacheTTL: S3_TRANSFORMED_IMAGE_CACHE_TTL,
-      maxImageSize: MAX_IMAGE_SIZE,
-    };
-    if (transformedImageBucket) lambdaEnv.transformedImageBucketName = transformedImageBucket.bucketName;
-
-    // IAM policy to read from the S3 bucket containing the original images
-    const s3ReadOriginalImagesPolicy = new iam.PolicyStatement({
-      actions: ['s3:GetObject'],
-      resources: ['arn:aws:s3:::' + originalImageBucket.bucketName + '/*'],
+          enabled: true,
+          expiration: Duration.days(30),
+        },
+      ],
     });
 
-    // statements of the IAM policy to attach to Lambda
-    var iamPolicyStatements = [s3ReadOriginalImagesPolicy];
-
-    // Create FFmpeg layer
-    const ffmpegLayer = new FFmpegLayer(this, 'ffmpeg-layer');
+    // Create ffmpeg layer
+    const ffmpegLayer = new FFmpegLayer(this, 'FfmpegLayer');
 
     // Create Lambda for image processing
     var lambdaProps = {
       runtime: lambda.Runtime.NODEJS_18_X,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset('functions/image-optimization'),
-      timeout: Duration.seconds(parseInt(LAMBDA_TIMEOUT)),
-      memorySize: parseInt(LAMBDA_MEMORY),
-      environment: lambdaEnv,
+      memorySize: 1024,
+      timeout: Duration.seconds(30),
+      environment: {
+        originalImageBucketName: ORIGINAL_IMAGE_BUCKET,
+        transformedImageBucketName: s3ThumbnailBucket.bucketName,
+        transformedImageCacheTTL: TRANSFORMED_IMAGE_CACHE_TTL,
+        maxImageSize: MAX_IMAGE_SIZE,
+      },
       logRetention: logs.RetentionDays.ONE_DAY,
       layers: [ffmpegLayer],
     };
-    var imageProcessing = new lambda.Function(this, 'image-optimization', lambdaProps);
 
-    // Enable Lambda URL
-    const imageProcessingURL = imageProcessing.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.NONE
+    const imageFunction = new lambda.Function(this, 'ImageFunction', {
+      ...lambdaProps,
+      functionName: 'geerly-image-optimization',
+      code: lambda.Code.fromAsset('functions/image-optimization'),
     });
 
-    // Leverage CDK Intrinsics to get the hostname of the Lambda URL 
-    const imageProcessingDomainName = Fn.parseDomainName(imageProcessingURL.url);
+    // Set removal policy for the function and create its URL
+    const cfnImageFunction = imageFunction.node.defaultChild as lambda.CfnFunction;
+    cfnImageFunction.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+    const imageFunctionUrl = imageFunction.addFunctionUrl({
+      authType: lambda.FunctionUrlAuthType.NONE,
+    });
 
-    // Create a CloudFront origin: S3 with fallback to Lambda when image needs to be transformed, otherwise with Lambda as sole origin
-    var imageOrigin;
-
-    if (transformedImageBucket) {
-      imageOrigin = new origins.OriginGroup({
-        primaryOrigin: new origins.S3Origin(transformedImageBucket, {
-          originShieldRegion: CLOUDFRONT_ORIGIN_SHIELD_REGION,
-        }),
-        fallbackOrigin: new origins.HttpOrigin(imageProcessingDomainName, {
-          originShieldRegion: CLOUDFRONT_ORIGIN_SHIELD_REGION,
+    // Create CloudFront distribution for image processing
+    const imageDistribution = new cloudfront.Distribution(this, 'ImageDistribution', {
+      defaultBehavior: {
+        origin: new origins.HttpOrigin('5senutkrqwldfryapozor2gpva0knzlv.lambda-url.us-east-1.on.aws', {
           customHeaders: {
             'x-origin-verify': 'cloudfront',
           },
-        }),
-        fallbackStatusCodes: [403, 500, 503, 504],
-      });
-
-      // write policy for Lambda on the s3 bucket for transformed images
-      var s3WriteTransformedImagesPolicy = new iam.PolicyStatement({
-        actions: ['s3:PutObject'],
-        resources: ['arn:aws:s3:::' + transformedImageBucket.bucketName + '/*'],
-      });
-      iamPolicyStatements.push(s3WriteTransformedImagesPolicy);
-    } else {
-      imageOrigin = new origins.HttpOrigin(imageProcessingDomainName, {
-        originShieldRegion: CLOUDFRONT_ORIGIN_SHIELD_REGION,
-        customHeaders: {
-          'x-origin-verify': 'cloudfront',
-        },
-      });
-    }
-
-    // attach iam policy to the role assumed by Lambda
-    imageProcessing.role?.attachInlinePolicy(
-      new iam.Policy(this, 'read-write-bucket-policy', {
-        statements: iamPolicyStatements,
-      }),
-    );
-
-    // Create a CloudFront Function for url rewrites
-    const urlRewriteFunction = new cloudfront.Function(this, 'urlRewrite', {
-      code: cloudfront.FunctionCode.fromFile({ filePath: 'functions/url-rewrite/index.js', }),
-      functionName: `urlRewriteFunction${this.node.addr}`,
-    });
-
-    var imageDeliveryCacheBehaviorConfig: ImageDeliveryCacheBehaviorConfig = {
-      origin: imageOrigin,
-      viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-      compress: false,
-      cachePolicy: new cloudfront.CachePolicy(this, `ImageCachePolicy${this.node.addr}`, {
-        defaultTtl: Duration.hours(24),
-        maxTtl: Duration.days(365),
-        minTtl: Duration.seconds(0)
-      }),
-      functionAssociations: [{
-        eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
-        function: urlRewriteFunction,
-      }],
-    }
-
-    if (CLOUDFRONT_CORS_ENABLED === 'true') {
-      // Creating a custom response headers policy. CORS allowed for all origins.
-      const imageResponseHeadersPolicy = new cloudfront.ResponseHeadersPolicy(this, `ResponseHeadersPolicy${this.node.addr}`, {
-        responseHeadersPolicyName: `ImageResponsePolicy${this.node.addr}`,
-        corsBehavior: {
-          accessControlAllowCredentials: false,
-          accessControlAllowHeaders: ['*'],
-          accessControlAllowMethods: ['GET'],
-          accessControlAllowOrigins: ['*'],
-          accessControlMaxAge: Duration.seconds(600),
-          originOverride: false,
-        },
-        // recognizing image requests that were processed by this solution
-        customHeadersBehavior: {
-          customHeaders: [
-            { header: 'x-aws-image-optimization', value: 'v1.0', override: true },
-            { header: 'vary', value: 'accept', override: true },
-          ],
-        }
-      });
-      imageDeliveryCacheBehaviorConfig.responseHeadersPolicy = imageResponseHeadersPolicy;
-    }
-    const imageDelivery = new cloudfront.Distribution(this, 'imageDeliveryDistribution', {
-      comment: 'image optimization - image delivery',
-      defaultBehavior: imageDeliveryCacheBehaviorConfig
-    });
-
-    // Remove OAC configuration as we're using custom header authentication
-    imageProcessing.addPermission("AllowCloudFrontServicePrincipal", {
-      principal: new iam.ServicePrincipal("cloudfront.amazonaws.com"),
-      action: "lambda:InvokeFunctionUrl",
-      sourceArn: `arn:aws:cloudfront::${this.account}:distribution/${imageDelivery.distributionId}`
-    });
-
-    new CfnOutput(this, 'ImageDeliveryDomain', {
-      description: 'Domain name of image delivery',
-      value: imageDelivery.distributionDomainName
-    });
-
-    // Create a new S3 bucket for thumbnails
-    const thumbnailBucket = new s3.Bucket(this, 's3-thumbnail-bucket', {
-      removalPolicy: RemovalPolicy.DESTROY,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      encryption: s3.BucketEncryption.S3_MANAGED,
-      enforceSSL: true,
-      autoDeleteObjects: true,
-      lifecycleRules: [
-        {
-          expiration: Duration.days(parseInt(S3_TRANSFORMED_IMAGE_EXPIRATION_DURATION)),
-        },
-      ],
-    });
-
-    // Add thumbnail bucket to Lambda environment variables
-    lambdaEnv.transformedImageBucketName = thumbnailBucket.bucketName;
-
-    // Add write permission for Lambda to the thumbnail bucket
-    const s3WriteThumbnailsPolicy = new iam.PolicyStatement({
-      actions: ['s3:PutObject'],
-      resources: ['arn:aws:s3:::' + thumbnailBucket.bucketName + '/*'],
-    });
-    iamPolicyStatements.push(s3WriteThumbnailsPolicy);
-
-    // Create a new CloudFront distribution for thumbnail processing
-    const thumbnailDelivery = new cloudfront.Distribution(this, 'thumbnailDeliveryDistribution', {
-      comment: 'video thumbnail processing - thumbnail delivery',
-      defaultBehavior: {
-        origin: new origins.OriginGroup({
-          primaryOrigin: new origins.S3Origin(thumbnailBucket, {
-            originShieldRegion: CLOUDFRONT_ORIGIN_SHIELD_REGION,
-          }),
-          fallbackOrigin: new origins.HttpOrigin(imageProcessingDomainName, {
-            originShieldRegion: CLOUDFRONT_ORIGIN_SHIELD_REGION,
-            customHeaders: {
-              'x-origin-verify': 'cloudfront',
-            },
-          }),
-          fallbackStatusCodes: [403, 500, 503, 504],
+          protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
         }),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-        compress: false,
-        cachePolicy: new cloudfront.CachePolicy(this, `ThumbnailCachePolicy${this.node.addr}`, {
-          defaultTtl: Duration.hours(24),
+        cachePolicy: new cloudfront.CachePolicy(this, 'ImageCachePolicy', {
+          defaultTtl: Duration.days(365),
+          minTtl: Duration.days(365),
           maxTtl: Duration.days(365),
-          minTtl: Duration.seconds(0)
+          queryStringBehavior: cloudfront.CacheQueryStringBehavior.all(),
         }),
-        functionAssociations: [{
-          eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
-          function: urlRewriteFunction,
-        }],
-        responseHeadersPolicy: CLOUDFRONT_CORS_ENABLED === 'true' 
-          ? new cloudfront.ResponseHeadersPolicy(this, `ThumbnailResponseHeadersPolicy${this.node.addr}`, {
-              responseHeadersPolicyName: `ThumbnailResponsePolicy${this.node.addr}`,
-              corsBehavior: {
-                accessControlAllowCredentials: false,
-                accessControlAllowHeaders: ['*'],
-                accessControlAllowMethods: ['GET'],
-                accessControlAllowOrigins: ['*'],
-                accessControlMaxAge: Duration.seconds(600),
-                originOverride: false,
-              },
-              customHeadersBehavior: {
-                customHeaders: [
-                  { header: 'x-aws-image-optimization', value: 'v1.0', override: true },
-                  { header: 'vary', value: 'accept', override: true },
-                ],
-              }
-            })
-          : undefined
-      }
+      },
+      certificate: acm.Certificate.fromCertificateArn(this, 'GeerlyDistributionCertificate', GEERLY_CERTIFICATE_ARN),
+      domainNames: ['cdn.geerly.com'],
+      comment: 'Geerly Image Optimization Distribution',
+      enabled: true,
     });
 
-    // Output the new distribution domain and bucket name
-    new CfnOutput(this, 'ThumbnailDeliveryDomain', {
-      description: 'Thumbnail processing distribution domain',
-      value: thumbnailDelivery.distributionDomainName
+    // Set removal policy for the distribution
+    const cfnImageDistribution = imageDistribution.node.defaultChild as cloudfront.CfnDistribution;
+    cfnImageDistribution.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+
+    // Create Lambda for video thumbnails
+    const videoFunction = new lambda.Function(this, 'VideoFunction', {
+      ...lambdaProps,
+      functionName: 'geerly-video-thumbnail',
+      code: lambda.Code.fromAsset('functions/video-thumbnail'),
+      environment: {
+        sourceBucketName: ORIGINAL_IMAGE_BUCKET,
+        thumbnailBucketName: s3ThumbnailBucket.bucketName,
+        thumbnailCacheTTL: THUMBNAIL_CACHE_TTL,
+      },
     });
-    new CfnOutput(this, 'ThumbnailBucketName', {
-      description: 'S3 bucket for storing thumbnails',
-      value: thumbnailBucket.bucketName
+
+    // Set removal policy for the function and create its URL
+    const cfnVideoFunction = videoFunction.node.defaultChild as lambda.CfnFunction;
+    cfnVideoFunction.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+    const videoFunctionUrl = videoFunction.addFunctionUrl({
+      authType: lambda.FunctionUrlAuthType.NONE,
+    });
+
+    // Create CloudFront distribution for video thumbnails
+    const thumbnailDistribution = new cloudfront.Distribution(this, 'ThumbnailDistribution', {
+      defaultBehavior: {
+        origin: new origins.HttpOrigin('gmesnpamafjq6ooohem5yfbrai0gdciq.lambda-url.us-east-1.on.aws', {
+          customHeaders: {
+            'x-origin-verify': 'cloudfront',
+          },
+          protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+        }),
+      viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        cachePolicy: new cloudfront.CachePolicy(this, 'ThumbnailCachePolicy', {
+          defaultTtl: Duration.days(365),
+          minTtl: Duration.days(365),
+        maxTtl: Duration.days(365),
+        }),
+      },
+      certificate: acm.Certificate.fromCertificateArn(this, 'BoilingkettleDistributionCertificate', BOILINGKETTLE_CERTIFICATE_ARN),
+      domainNames: ['thumbnail.boilingkettle.co'],
+      comment: 'Boiling Kettle Video Thumbnail Distribution',
+      enabled: true,
+    });
+
+    // Set removal policy for the distribution
+    const cfnThumbnailDistribution = thumbnailDistribution.node.defaultChild as cloudfront.CfnDistribution;
+    cfnThumbnailDistribution.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+
+    // Grant Lambda functions access to S3 buckets
+    s3ThumbnailBucket.grantReadWrite(imageFunction);
+    s3ThumbnailBucket.grantReadWrite(videoFunction);
+
+    // Grant access to source bucket
+    const sourceBucketArn = `arn:aws:s3:::${ORIGINAL_IMAGE_BUCKET}`;
+    const sourceBucketPolicy = new iam.PolicyStatement({
+      actions: ['s3:GetObject'],
+      resources: [sourceBucketArn, `${sourceBucketArn}/*`],
+    });
+    imageFunction.addToRolePolicy(sourceBucketPolicy);
+    videoFunction.addToRolePolicy(sourceBucketPolicy);
+
+    // Output the CloudFront domains and bucket names
+    new cdk.CfnOutput(this, 'ImageDeliveryDomain', {
+      value: imageDistribution.distributionDomainName,
+    });
+
+    new cdk.CfnOutput(this, 'VideoThumbnailDomain', {
+      value: thumbnailDistribution.distributionDomainName,
+    });
+
+    new cdk.CfnOutput(this, 'ThumbnailBucketName', {
+      value: s3ThumbnailBucket.bucketName,
+    });
+
+    new cdk.CfnOutput(this, 'OriginalImagesS3Bucket', {
+      value: ORIGINAL_IMAGE_BUCKET,
     });
   }
 }
