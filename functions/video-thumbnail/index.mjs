@@ -5,15 +5,25 @@ import { unlink } from 'fs/promises';
 import path from 'path';
 import { exec } from 'child_process';
 import { readdir } from 'fs/promises';
+import { join } from 'path';
 
-const s3Client = new S3Client();
-
-// Project to bucket mapping
+// Define configuration directly in the function code since we can't import from outside
 const PROJECT_BUCKETS = {
+    'geerly': 'geerly-cms-content',
     'farmify': 'files-farmify',
-    'sopilot': 'files-sopilot',
-    'geerly': 'geerly-cms-content'
+    'sopilot': 'files-sopilot'
 };
+
+const CONFIG = {
+    CACHE_TTL: 'public, max-age=31536000',
+    MAX_IMAGE_SIZE: 10485760,
+    SUPPORTED_FORMATS: ['jpeg', 'gif', 'webp', 'png', 'avif'],
+    DEFAULT_QUALITY: 80
+};
+
+const s3Client = new S3Client({});
+const THUMBNAIL_BUCKET = process.env.thumbnailBucketName;
+const THUMBNAIL_CACHE_TTL = process.env.thumbnailCacheTTL || CONFIG.CACHE_TTL;
 
 // Validate project name and get bucket
 function getProjectBucket(projectName) {
@@ -48,34 +58,7 @@ async function getThumbnail(bucket, key) {
 }
 
 async function generateThumbnail(videoPath, thumbnailPath) {
-    // Debug: List contents of /opt
-    try {
-        console.log('Contents of /opt:');
-        const optContents = await readdir('/opt');
-        console.log(optContents);
-
-        console.log('Contents of /opt/bin (if exists):');
-        try {
-            const binContents = await readdir('/opt/bin');
-            console.log(binContents);
-        } catch (e) {
-            console.log('Error reading /opt/bin:', e.message);
-        }
-
-        // Try to find ffmpeg
-        console.log('Searching for ffmpeg:');
-        await new Promise((resolve, reject) => {
-            exec('which ffmpeg', (error, stdout, stderr) => {
-                console.log('which ffmpeg result:', stdout || 'not found');
-                resolve();
-            });
-        });
-    } catch (e) {
-        console.log('Error listing directories:', e);
-    }
-
     return new Promise((resolve, reject) => {
-        // Use ffmpeg from the Lambda layer
         const ffmpeg = spawn('/opt/bin/ffmpeg', [
             '-i', videoPath,
             '-ss', '00:00:01',
@@ -85,12 +68,12 @@ async function generateThumbnail(videoPath, thumbnailPath) {
         ]);
 
         ffmpeg.on('error', (err) => {
-            console.log('FFmpeg spawn error:', err);
+            console.error('FFmpeg error:', err);
             reject(err);
         });
 
         ffmpeg.stderr.on('data', (data) => {
-            console.log(`ffmpeg stderr: ${data}`);
+            console.debug(`ffmpeg stderr: ${data}`);
         });
 
         ffmpeg.on('close', (code) => {

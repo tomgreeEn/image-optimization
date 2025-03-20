@@ -4,11 +4,24 @@
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import Sharp from 'sharp';
 
+// Define configuration directly in the function code since we can't import from outside
+const PROJECT_BUCKETS = {
+    'geerly': 'geerly-cms-content',
+    'farmify': 'files-farmify',
+    'sopilot': 'files-sopilot'
+};
+
+const CONFIG = {
+    CACHE_TTL: 'public, max-age=31536000',
+    MAX_IMAGE_SIZE: 10485760,
+    SUPPORTED_FORMATS: ['jpeg', 'gif', 'webp', 'png', 'avif'],
+    DEFAULT_QUALITY: 80
+};
+
 const s3Client = new S3Client();
-const S3_ORIGINAL_IMAGE_BUCKET = process.env.originalImageBucketName;
-const S3_TRANSFORMED_IMAGE_BUCKET = process.env.transformedImageBucketName;
-const TRANSFORMED_IMAGE_CACHE_TTL = process.env.transformedImageCacheTTL;
-const MAX_IMAGE_SIZE = parseInt(process.env.maxImageSize);
+const S3_TRANSFORMED_IMAGE_BUCKET = process.env.thumbnailBucketName;
+const TRANSFORMED_IMAGE_CACHE_TTL = process.env.transformedImageCacheTTL || CONFIG.CACHE_TTL;
+const MAX_IMAGE_SIZE = parseInt(process.env.maxImageSize || CONFIG.MAX_IMAGE_SIZE);
 
 export const handler = async (event) => {
     // Validate if this is a GET request
@@ -32,9 +45,19 @@ export const handler = async (event) => {
 
     // Remove leading slash and split path
     const pathParts = path.substring(1).split('/');
-    if (pathParts.length < 1) {
+    if (pathParts.length < 2) { // Need at least project and image path
         return sendError(400, 'Invalid request: malformed image path', null);
     }
+
+    // Extract project and determine bucket
+    const project = pathParts[0];
+    const bucket = PROJECT_BUCKETS[project];
+    if (!bucket) {
+        return sendError(400, `Invalid project: ${project}`, null);
+    }
+
+    // Remove project from path parts for image path
+    pathParts.shift();
 
     // The last part might be operations
     let operations = {};
@@ -61,14 +84,14 @@ export const handler = async (event) => {
     let originalImageBody;
     let contentType;
     try {
-        const getOriginalImageCommand = new GetObjectCommand({ Bucket: S3_ORIGINAL_IMAGE_BUCKET, Key: imagePath });
+        const getOriginalImageCommand = new GetObjectCommand({ Bucket: bucket, Key: imagePath });
         const getOriginalImageCommandOutput = await s3Client.send(getOriginalImageCommand);
-        console.log(`Got response from S3 for ${imagePath}`);
+        console.log(`Got response from S3 for ${imagePath} in bucket ${bucket}`);
 
         originalImageBody = getOriginalImageCommandOutput.Body.transformToByteArray();
         contentType = getOriginalImageCommandOutput.ContentType;
     } catch (error) {
-        return sendError(404, `Image not found: ${imagePath}`, error);
+        return sendError(404, `Image not found: ${project}/${imagePath}`, error);
     }
     let transformedImage = Sharp(await originalImageBody, { failOn: 'none', animated: true });
     // Get image orientation to rotate if needed

@@ -1,83 +1,114 @@
-# AWS Image Optimization Service
+# Image Optimization Service
 
-This project implements a serverless image optimization service using AWS CDK, Lambda, and CloudFront. It allows for real-time image transformations including resizing, format conversion, and quality adjustments.
-
-## Architecture
-
-The service uses the following AWS components:
-- AWS Lambda for image processing
-- Amazon S3 for storage
-- Amazon CloudFront for content delivery
-- AWS CDK for infrastructure as code
+This service provides image optimization and video thumbnail generation through AWS Lambda and CloudFront. It supports multiple projects with different S3 bucket sources.
 
 ## Features
 
-- On-the-fly image transformations
-- Supported operations:
-  - Resize (width/height)
-  - Format conversion (JPEG, PNG, WebP, AVIF, GIF)
-  - Quality adjustment for lossy formats
-  - Automatic image rotation based on EXIF data
-- Caching at CloudFront edge locations
-- Fallback to S3 for large images
-- CloudFront Origin Access Control (OAC) for security
+- Image optimization with Sharp
+- Video thumbnail generation with FFmpeg
+- Project-based S3 bucket routing
+- CloudFront distribution for caching
+- Configurable image operations (resize, format, quality)
 
-## Prerequisites
+## Architecture
 
-- Node.js 18.x or later
-- AWS CLI configured with appropriate credentials
-- AWS CDK CLI installed (`npm install -g aws-cdk`)
+The service consists of two main components:
 
-## Installation
+1. **Image Optimization Function**
+   - Handles image transformations (resize, format conversion, compression)
+   - Routes requests to appropriate S3 buckets based on project
+   - Caches transformed images
 
-1. Clone the repository:
-   ```bash
-   git clone [repository-url]
-   cd image-optimization
+2. **Video Thumbnail Function**
+   - Generates thumbnails from video files
+   - Uses FFmpeg for video processing
+   - Project-based bucket routing
+   - Caches generated thumbnails
+
+## URL Structure
+
+### Image Optimization
+```
+https://images.boilingkettle.co/{project}/{path/to/image}[?operations]
+```
+
+Example operations:
+- Resize: `?width=800&height=600`
+- Format conversion: `?format=webp`
+- Quality: `?quality=80`
+
+### Video Thumbnails
+```
+https://thumbnail.boilingkettle.co/{project}/{path/to/video}
+```
+
+## Adding a New Project
+
+1. Update `config/projects.js`:
+   ```javascript
+   export const PROJECT_BUCKETS = {
+       'your-project': 'your-s3-bucket',
+       // ... existing projects ...
+   };
    ```
 
-2. Install dependencies:
-   ```bash
-   npm install
+2. Ensure the Lambda functions have proper IAM permissions:
+   ```typescript
+   // In lib/image-optimization-stack.ts
+   PROJECT_BUCKETS.forEach(bucketName => {
+     const bucket = s3.Bucket.fromBucketName(this, `${bucketName}Bucket`, bucketName);
+     bucket.grantRead(imageFunction);
+     bucket.grantRead(videoFunction);
+   });
    ```
 
-3. Deploy the stack:
+3. Deploy the changes:
    ```bash
    cdk deploy
    ```
 
-## Usage
+## Configuration
 
-After deployment, you can transform images using URL parameters. Examples:
+All configuration is centralized in `config/projects.js`:
 
-1. Resize an image:
-   ```
-   https://[cloudfront-domain]/path/to/image.jpg/width=300
-   ```
-
-2. Convert format and resize:
-   ```
-   https://[cloudfront-domain]/path/to/image.jpg/format=webp,width=300
-   ```
-
-3. Adjust quality:
-   ```
-   https://[cloudfront-domain]/path/to/image.jpg/format=jpeg,quality=80
-   ```
+- `PROJECT_BUCKETS`: Maps project names to S3 buckets
+- `CONFIG`: Default settings for image optimization
+  - `CACHE_TTL`: Cache duration for transformed images
+  - `MAX_IMAGE_SIZE`: Maximum size for transformed images
+  - `SUPPORTED_FORMATS`: List of supported image formats
+  - `DEFAULT_QUALITY`: Default quality for lossy formats
 
 ## Environment Variables
 
-The following environment variables can be configured:
-- `originalImageBucketName`: S3 bucket for original images
-- `transformedImageBucketName`: S3 bucket for transformed images
-- `transformedImageCacheTTL`: Cache duration for transformed images
-- `maxImageSize`: Maximum size limit for transformed images
+The following environment variables can be set to override defaults:
 
-## Security
+- `thumbnailBucketName`: S3 bucket for storing transformed images
+- `transformedImageCacheTTL`: Cache control header for transformed images
+- `maxImageSize`: Maximum size for transformed images in bytes
 
-- CloudFront Origin Access Control (OAC) is implemented
-- S3 buckets are not publicly accessible
-- Lambda function validates requests origin
+## Development
+
+1. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+2. Deploy the stack:
+   ```bash
+   cdk deploy
+   ```
+
+## Testing
+
+Test image optimization:
+```bash
+curl https://images.boilingkettle.co/project/path/to/image?width=800
+```
+
+Test video thumbnails:
+```bash
+curl https://thumbnail.boilingkettle.co/project/path/to/video
+```
 
 ## License
 
