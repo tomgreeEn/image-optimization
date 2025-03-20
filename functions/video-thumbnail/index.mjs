@@ -6,6 +6,7 @@ import path from 'path';
 import { exec } from 'child_process';
 import { readdir } from 'fs/promises';
 import { join } from 'path';
+import fs from 'fs';
 
 // Define configuration directly in the function code since we can't import from outside
 const PROJECT_BUCKETS = {
@@ -27,11 +28,11 @@ const THUMBNAIL_CACHE_TTL = process.env.thumbnailCacheTTL || CONFIG.CACHE_TTL;
 
 // Validate project name and get bucket
 function getProjectBucket(projectName) {
-    const bucket = PROJECT_BUCKETS[projectName.toLowerCase()];
-    if (!bucket) {
+    const bucketName = PROJECT_BUCKETS[projectName];
+    if (!bucketName) {
         throw new Error(`Invalid project: ${projectName}`);
     }
-    return bucket;
+    return bucketName;
 }
 
 async function checkThumbnailExists(bucket, key) {
@@ -57,33 +58,83 @@ async function getThumbnail(bucket, key) {
     return response.Body.transformToByteArray();
 }
 
-async function generateThumbnail(videoPath, thumbnailPath) {
-    return new Promise((resolve, reject) => {
-        const ffmpeg = spawn('/opt/bin/ffmpeg', [
-            '-i', videoPath,
-            '-ss', '00:00:01',
-            '-vframes', '1',
-            '-f', 'image2',
-            thumbnailPath
-        ]);
+async function getVideoFromS3(bucket, key) {
+    try {
+        const response = await s3Client.send(new GetObjectCommand({
+            Bucket: bucket,
+            Key: key,
+        }));
+        return await response.Body.transformToByteArray();
+    } catch (error) {
+        if (error.name === 'NoSuchKey') {
+            return null;
+        }
+        throw error;
+    }
+}
 
-        ffmpeg.on('error', (err) => {
-            console.error('FFmpeg error:', err);
-            reject(err);
-        });
+async function generateThumbnail(videoBuffer) {
+    const tempVideoPath = '/tmp/temp_video.mp4';
+    const tempThumbnailPath = '/tmp/temp_thumbnail.jpg';
 
-        ffmpeg.stderr.on('data', (data) => {
-            console.debug(`ffmpeg stderr: ${data}`);
-        });
+    try {
+        // Write video buffer to temporary file
+        await fs.promises.writeFile(tempVideoPath, Buffer.from(videoBuffer));
 
-        ffmpeg.on('close', (code) => {
-            if (code === 0) {
-                resolve();
-            } else {
-                reject(new Error(`ffmpeg process exited with code ${code}`));
-            }
+        return new Promise((resolve, reject) => {
+            const ffmpeg = spawn('/opt/bin/ffmpeg', [
+                '-i', tempVideoPath,
+                '-vf', 'thumbnail,scale=640:360:force_original_aspect_ratio=decrease',
+                '-frames:v', '1',
+                '-f', 'image2pipe',
+                '-vcodec', 'mjpeg',
+                tempThumbnailPath
+            ]);
+
+            let errorOutput = '';
+
+            ffmpeg.stderr.on('data', (data) => {
+                errorOutput += data.toString();
+            });
+
+            ffmpeg.on('close', async (code) => {
+                try {
+                    if (code === 0) {
+                        // Read the generated thumbnail
+                        const thumbnailBuffer = await fs.promises.readFile(tempThumbnailPath);
+                        resolve(thumbnailBuffer);
+                    } else {
+                        console.error('FFmpeg error:', errorOutput);
+                        reject(new Error(`FFmpeg process exited with code ${code}`));
+                    }
+                } catch (error) {
+                    reject(error);
+                } finally {
+                    // Clean up temporary files
+                    try {
+                        await fs.promises.unlink(tempVideoPath);
+                        await fs.promises.unlink(tempThumbnailPath);
+                    } catch (error) {
+                        console.warn('Failed to cleanup temporary files:', error);
+                    }
+                }
+            });
+
+            ffmpeg.on('error', (err) => {
+                console.error('FFmpeg spawn error:', err);
+                reject(err);
+            });
         });
-    });
+    } catch (error) {
+        // Clean up temporary files in case of error
+        try {
+            await fs.promises.unlink(tempVideoPath);
+            await fs.promises.unlink(tempThumbnailPath);
+        } catch (cleanupError) {
+            console.warn('Failed to cleanup temporary files:', cleanupError);
+        }
+        throw error;
+    }
 }
 
 async function downloadVideo(bucket, key) {
@@ -125,101 +176,101 @@ async function cleanup(...paths) {
     }
 }
 
+// Extract project and path from the request
+function parseRequest(event) {
+    if (!event.rawPath) return null;
+
+    const parts = event.rawPath.slice(1).split('/');
+    if (parts.length < 2) return null;
+
+    return {
+        projectName: parts[0],
+        videoPath: parts.slice(1).join('/')
+    };
+}
+
 export const handler = async (event) => {
     try {
-        // Extract video path from the request
-        if (!event.requestContext?.http?.path) {
-            return { statusCode: 400, body: JSON.stringify({
-                message: 'Invalid request',
-                error: 'No path provided'
-            })};
-        }
-
-        // Remove leading slash and decode the path
-        const fullPath = decodeURIComponent(event.requestContext.http.path.substring(1));
+        // Parse the request path
+        const path = event.rawPath.slice(1); // Remove leading slash
+        const parts = path.split('/');
         
-        // Split path into project and video path
-        const [projectName, ...pathParts] = fullPath.split('/');
-        if (!projectName || pathParts.length === 0) {
-            return { statusCode: 400, body: JSON.stringify({
-                message: 'Invalid request',
-                error: 'Path must be in format: /{project}/{video_path}'
-            })};
-        }
-
-        try {
-            // Get the bucket for this project
-            const sourceBucket = getProjectBucket(projectName);
-            const videoPath = pathParts.join('/');
-            const thumbnailBucket = process.env.thumbnailBucketName;
-
-            // Check if thumbnail already exists
-            const thumbnailExists = await checkThumbnailExists(thumbnailBucket, `${projectName}/${videoPath}`);
-            if (thumbnailExists) {
-                console.log(`Thumbnail exists for ${projectName}/${videoPath}, returning from cache`);
-                const thumbnail = await getThumbnail(thumbnailBucket, `${projectName}/${videoPath}`);
-                return {
-                    statusCode: 200,
-                    body: Buffer.from(thumbnail).toString('base64'),
-                    isBase64Encoded: true,
-                    headers: {
-                        'Content-Type': 'image/jpeg',
-                        'Cache-Control': process.env.thumbnailCacheTTL || 'public, max-age=31536000'
-                    }
-                };
-            }
-
-            // Download video to temp directory
-            console.log(`Downloading video from ${sourceBucket}/${videoPath}`);
-            const videoLocalPath = await downloadVideo(sourceBucket, videoPath);
-            const thumbnailLocalPath = `${videoLocalPath}.jpg`;
-
-            // Generate thumbnail
-            console.log('Generating thumbnail');
-            await generateThumbnail(videoLocalPath, thumbnailLocalPath);
-
-            // Upload thumbnail to S3 with project prefix
-            console.log('Uploading thumbnail');
-            await uploadThumbnail(thumbnailLocalPath, thumbnailBucket, `${projectName}/${videoPath}`);
-
-            // Read the generated thumbnail
-            const thumbnailBuffer = await getThumbnail(thumbnailBucket, `${projectName}/${videoPath}`);
-
-            // Cleanup temporary files
-            await cleanup(videoLocalPath, thumbnailLocalPath);
-
-            // Return the thumbnail
+        if (parts.length < 1) {
             return {
-                statusCode: 200,
-                body: Buffer.from(thumbnailBuffer).toString('base64'),
-                isBase64Encoded: true,
-                headers: {
-                    'Content-Type': 'image/jpeg',
-                    'Cache-Control': process.env.thumbnailCacheTTL || 'public, max-age=31536000'
-                }
+                statusCode: 400,
+                body: JSON.stringify({ error: 'Invalid path format. Expected: {project}/path/to/video' }),
             };
-
-        } catch (error) {
-            if (error.message.startsWith('Invalid project:')) {
-                return {
-                    statusCode: 400,
-                    body: JSON.stringify({
-                        message: 'Invalid project',
-                        error: error.message
-                    })
-                };
-            }
-            throw error;
         }
 
-    } catch (error) {
-        console.error('Error processing request:', error);
+        const projectName = parts[0];
+        const videoPath = parts.slice(1).join('/'); // Keep the full path after project name
+        const bucketName = PROJECT_BUCKETS[projectName];
+
+        if (!bucketName) {
+            return {
+                statusCode: 404,
+                body: JSON.stringify({ error: `Project '${projectName}' not found` }),
+            };
+        }
+
+        // Check if thumbnail already exists
+        const thumbnailKey = `thumbnails/${videoPath}.jpg`;
+        const thumbnailExists = await checkThumbnailExists(bucketName, thumbnailKey);
+
+        // Build redirect URL with query parameters
+        const queryString = event.rawQueryString ? `?${event.rawQueryString}` : '';
+        const redirectUrl = `https://image.boilingkettle.co/${projectName}/${thumbnailKey}${queryString}`;
+
+        if (thumbnailExists) {
+            // Thumbnail exists, redirect to image optimization endpoint
+            return {
+                statusCode: 302,
+                headers: {
+                    'Location': redirectUrl,
+                    'Cache-Control': CONFIG.CACHE_TTL,
+                },
+            };
+        }
+
+        // Get video from S3
+        const videoData = await getVideoFromS3(bucketName, videoPath);
+        if (!videoData) {
+            return {
+                statusCode: 404,
+                body: JSON.stringify({ error: `Video not found: ${videoPath}` }),
+            };
+        }
+
+        // Generate thumbnail
+        const thumbnailBuffer = await generateThumbnail(videoData);
+        if (!thumbnailBuffer) {
+            return {
+                statusCode: 500,
+                body: JSON.stringify({ error: 'Failed to generate thumbnail' }),
+            };
+        }
+
+        // Upload thumbnail to S3
+        await s3Client.send(new PutObjectCommand({
+            Bucket: bucketName,
+            Key: thumbnailKey,
+            Body: thumbnailBuffer,
+            ContentType: 'image/jpeg',
+        }));
+
+        // Redirect to image optimization endpoint with query parameters
         return {
-            statusCode: error.statusCode || 500,
-            body: JSON.stringify({
-                message: 'Error generating thumbnail',
-                error: error.message
-            })
+            statusCode: 302,
+            headers: {
+                'Location': redirectUrl,
+                'Cache-Control': CONFIG.CACHE_TTL,
+            },
+        };
+    } catch (error) {
+        console.error('Error processing video:', error);
+        return {
+            statusCode: 500,
+            body: JSON.stringify({ error: 'Error processing video' }),
         };
     }
 }; 
