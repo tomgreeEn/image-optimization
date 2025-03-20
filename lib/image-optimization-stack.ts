@@ -10,13 +10,12 @@ import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
-import { Duration } from 'aws-cdk-lib';
+import { Duration, Token } from 'aws-cdk-lib';
 import { FFmpegLayer } from './ffmpeg-layer';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 
 // Environment variables
-const LAMBDA_MEMORY = process.env.LAMBDA_MEMORY || '2048';
-const LAMBDA_TIMEOUT = process.env.LAMBDA_TIMEOUT || '30';
+
 const ORIGINAL_IMAGE_BUCKET = process.env.ORIGINAL_IMAGE_BUCKET || 'geerly-cms-content';
 const TRANSFORMED_IMAGE_CACHE_TTL = process.env.TRANSFORMED_IMAGE_CACHE_TTL || 'public, max-age=31536000';
 const MAX_IMAGE_SIZE = process.env.MAX_IMAGE_SIZE || '10485760';
@@ -73,11 +72,12 @@ export class ImgTransformationStack extends cdk.Stack {
     const imageFunctionUrl = imageFunction.addFunctionUrl({
       authType: lambda.FunctionUrlAuthType.NONE,
     });
+    const imageFunctionUrlDomain = cdk.Fn.select(2, cdk.Fn.split('/', imageFunctionUrl.url));
 
     // Create CloudFront distribution for image processing
     const imageDistribution = new cloudfront.Distribution(this, 'ImageDistribution', {
       defaultBehavior: {
-        origin: new origins.HttpOrigin('5senutkrqwldfryapozor2gpva0knzlv.lambda-url.us-east-1.on.aws', {
+        origin: new origins.HttpOrigin(imageFunctionUrlDomain, {
           customHeaders: {
             'x-origin-verify': 'cloudfront',
           },
@@ -104,9 +104,15 @@ export class ImgTransformationStack extends cdk.Stack {
     // Create Lambda for video thumbnails
     const videoFunction = new lambda.Function(this, 'VideoFunction', {
       ...lambdaProps,
-      functionName: 'geerly-video-thumbnail',
+      functionName: 'video-thumbnail',
       code: lambda.Code.fromAsset('functions/video-thumbnail'),
+      layers: [
+        lambda.LayerVersion.fromLayerVersionArn(this, 'FFmpegLayer', 
+          'arn:aws:lambda:us-east-1:656044625343:layer:ffmpeg:1'
+        )
+      ],
       environment: {
+        ...lambdaProps.environment,
         sourceBucketName: ORIGINAL_IMAGE_BUCKET,
         thumbnailBucketName: s3ThumbnailBucket.bucketName,
         thumbnailCacheTTL: THUMBNAIL_CACHE_TTL,
@@ -116,15 +122,32 @@ export class ImgTransformationStack extends cdk.Stack {
     // Set removal policy for the function and create its URL
     const cfnVideoFunction = videoFunction.node.defaultChild as lambda.CfnFunction;
     cfnVideoFunction.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+
+    // Grant access to source buckets
+    const projectBuckets = [
+      'geerly-cms-content',
+      'files-farmify',
+      'files-sopilot'
+    ];
+
+    projectBuckets.forEach(bucketName => {
+      const bucketArn = `arn:aws:s3:::${bucketName}`;
+      const bucketPolicy = new iam.PolicyStatement({
+        actions: ['s3:GetObject', 's3:ListBucket'],
+        resources: [bucketArn, `${bucketArn}/*`],
+      });
+      videoFunction.addToRolePolicy(bucketPolicy);
+    });
+
+    // Create video function URL
     const videoFunctionUrl = videoFunction.addFunctionUrl({
       authType: lambda.FunctionUrlAuthType.NONE,
     });
-
+    const videoFunctionUrlDomain = cdk.Fn.select(2, cdk.Fn.split('/', videoFunctionUrl.url));
     // Create CloudFront distribution for video thumbnails
     const thumbnailDistribution = new cloudfront.Distribution(this, 'ThumbnailDistribution', {
       defaultBehavior: {
-        origin: new origins.HttpOrigin('gmesnpamafjq6ooohem5yfbrai0gdciq.lambda-url.us-east-1.on.aws', {
-          customHeaders: {
+    origin: new origins.HttpOrigin(videoFunctionUrlDomain, {          customHeaders: {
             'x-origin-verify': 'cloudfront',
           },
           protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
@@ -167,6 +190,14 @@ export class ImgTransformationStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'VideoThumbnailDomain', {
       value: thumbnailDistribution.distributionDomainName,
     });
+
+    new cdk.CfnOutput(this, 'ImageFunctionUrl', {
+  value: imageFunctionUrl.url,
+});
+
+new cdk.CfnOutput(this, 'VideoFunctionUrl', {
+  value: videoFunctionUrl.url,
+});
 
     new cdk.CfnOutput(this, 'ThumbnailBucketName', {
       value: s3ThumbnailBucket.bucketName,
