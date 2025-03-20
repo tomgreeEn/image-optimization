@@ -1,19 +1,25 @@
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import sharp from 'sharp';
-import { PROJECT_BUCKETS, CONFIG } from '../../config/projects';
+const sharp = require('sharp');
+import { PROJECT_BUCKETS, CONFIG } from './config/projects';
 
 const s3Client = new S3Client({});
+
+type SupportedFormat = typeof CONFIG.SUPPORTED_FORMATS[number];
 
 interface ImageParams {
   width?: number;
   height?: number;
   quality?: number;
-  format?: string;
+  format?: SupportedFormat;
 }
 
 interface ImageRequest {
   path: string;
   params: ImageParams;
+}
+
+function isVideoThumbnail(path: string): boolean {
+  return path.endsWith('.mp4.jpg');
 }
 
 export const handler = async (event: any) => {
@@ -50,6 +56,19 @@ export const handler = async (event: any) => {
       };
     }
 
+    // If this is a video thumbnail, serve it as-is without transformation
+    if (isVideoThumbnail(imagePath)) {
+      return {
+        statusCode: 200,
+        headers: {
+          'Content-Type': 'image/jpeg',
+          'Cache-Control': CONFIG.CACHE_TTL,
+        },
+        body: imageData.toString('base64'),
+        isBase64Encoded: true,
+      };
+    }
+
     const transformedImage = await transformImage(imageData, request.params);
 
     return {
@@ -63,9 +82,18 @@ export const handler = async (event: any) => {
     };
   } catch (error) {
     console.error('Error processing image:', error);
+    // Log the full error details
+    if (error instanceof Error) {
+      console.error('Error name:', error.name);
+      console.error('Error message:', error.message);
+      console.error('Error stack:', error.stack);
+    }
     return {
       statusCode: 500,
-      body: JSON.stringify({ error: 'Error processing image' }),
+      body: JSON.stringify({ 
+        error: 'Error processing image',
+        details: error instanceof Error ? error.message : 'Unknown error'
+      }),
     };
   }
 };
@@ -79,7 +107,7 @@ function parseRequest(event: any): ImageRequest | null {
     if (width) params.width = parseInt(width, 10);
     if (height) params.height = parseInt(height, 10);
     if (quality) params.quality = parseInt(quality, 10);
-    if (format) params.format = format.toLowerCase();
+    if (format) params.format = format.toLowerCase() as SupportedFormat;
   }
 
   return {
@@ -129,7 +157,7 @@ async function transformImage(buffer: Buffer, params: ImageParams): Promise<Buff
   }
 
   // Convert format if specified and supported
-  const format = params.format && CONFIG.SUPPORTED_FORMATS.includes(params.format)
+  const format = params.format && CONFIG.SUPPORTED_FORMATS.includes(params.format as SupportedFormat)
     ? params.format
     : 'jpeg';
 

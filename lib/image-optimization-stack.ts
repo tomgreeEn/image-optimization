@@ -61,10 +61,31 @@ export class ImgTransformationStack extends cdk.Stack {
     };
 
     // Create Lambda function for image transformation
-    const imageFunction = new lambda.Function(this, 'ImageFunction', {
+    const imageFunction = new NodejsFunction(this, 'ImageFunction', {
       ...lambdaProps,
-      handler: 'index.handler',
-      code: lambda.Code.fromAsset('functions/image-optimization'),
+      entry: 'functions/image-optimization/index.ts',
+      bundling: {
+        minify: true,
+        sourceMap: true,
+        externalModules: ['sharp'],
+        nodeModules: ['sharp'],
+        forceDockerBundling: true,
+        commandHooks: {
+          beforeBundling: (inputDir: string, outputDir: string) => {
+            return [
+              `mkdir -p ${inputDir}/functions/image-optimization/config`,
+              `cp ${inputDir}/config/projects.ts ${inputDir}/functions/image-optimization/config/`,
+              `cd ${outputDir} && npm install --platform=linux --arch=x64 sharp`
+            ];
+          },
+          beforeInstall: () => [],
+          afterBundling: (inputDir: string, outputDir: string) => {
+            return [
+              `rm -rf ${inputDir}/functions/image-optimization/config`,
+            ];
+          },
+        },
+      },
     });
 
     // Create Lambda function URL for image transformation
