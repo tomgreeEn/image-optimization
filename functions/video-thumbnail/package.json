@@ -1,10 +1,19 @@
 {
-  "name": "video-thumbnail-function",
+  "name": "video-thumbnail",
   "version": "1.0.0",
-  "description": "Lambda function for generating video thumbnails",
-  "main": "index.mjs",
-  "type": "module",
+  "description": "Lambda function to generate video thumbnails",
+  "main": "dist/index.js",
+  "scripts": {
+    "prebuild": "mkdir -p config && cp ../../config/projects.ts config/",
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.147",
+    "@types/node": "^18.0.0",
+    "typescript": "^5.0.0"
   }
-} 
+}

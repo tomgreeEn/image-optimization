@@ -9,7 +9,11 @@
     "watch": "tsc -w",
     "test": "jest",
     "cdk": "cdk",
-    "prebuild": "npm install --platform=linux --arch=x64 sharp"
+    "prebuild": "npm install --platform=linux --arch=x64 sharp",
+    "build:video-thumbnail": "cd functions/video-thumbnail && npm install && npm run build",
+    "build:image-optimization": "cd functions/image-optimization && npm install && npm run build",
+    "build:functions": "npm run build:video-thumbnail && npm run build:image-optimization",
+    "deploy": "npm run build:functions && cdk deploy"
   },
   "devDependencies": {
     "@types/jest": "^29.5.5",

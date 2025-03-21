@@ -1,184 +1,208 @@
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
-const sharp = require('sharp');
+//import sharp from 'sharp';
 import { PROJECT_BUCKETS, CONFIG } from './config/projects';
+const sharp = require('sharp');
 
 const s3Client = new S3Client({});
 
-type SupportedFormat = typeof CONFIG.SUPPORTED_FORMATS[number];
-
-interface ImageParams {
+interface ParsedRequest {
+  projectName: string;
+  imagePath: string;
   width?: number;
   height?: number;
   quality?: number;
-  format?: SupportedFormat;
 }
 
-interface ImageRequest {
-  path: string;
-  params: ImageParams;
-}
-
-function isVideoThumbnail(path: string): boolean {
-  return path.endsWith('.mp4.jpg');
-}
-
-export const handler = async (event: any) => {
+function parseRequest(event: any): ParsedRequest | null {
   try {
-    const request = parseRequest(event);
-    if (!request) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: 'Invalid request path or parameters' }),
-      };
-    }
+    const path = event.pathParameters?.proxy || '';
+    if (!path) return null;
 
-    const { projectName, imagePath } = extractProjectAndPath(request.path);
-    if (!projectName || !imagePath) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: 'Invalid path format. Expected: {project}/{path/to/image}' }),
-      };
-    }
+    const parts = path.split('/');
+    if (parts.length < 2) return null;
 
-    const bucketName = PROJECT_BUCKETS[projectName as keyof typeof PROJECT_BUCKETS];
-    if (!bucketName) {
-      return {
-        statusCode: 404,
-        body: JSON.stringify({ error: `Project '${projectName}' not found` }),
-      };
-    }
+    const projectName = parts[0];
+    const imagePath = parts.slice(1).join('/');
 
-    const imageData = await getImageFromS3(bucketName, imagePath);
-    if (!imageData) {
-      return {
-        statusCode: 404,
-        body: JSON.stringify({ error: `Image not found: ${imagePath}` }),
-      };
-    }
+    if (!projectName || !imagePath) return null;
 
-    // If this is a video thumbnail, serve it as-is without transformation
-    if (isVideoThumbnail(imagePath)) {
-      return {
-        statusCode: 200,
-        headers: {
-          'Content-Type': 'image/jpeg',
-          'Cache-Control': CONFIG.CACHE_TTL,
-        },
-        body: imageData.toString('base64'),
-        isBase64Encoded: true,
-      };
-    }
+    // Parse query parameters
+    const queryParams = event.queryStringParameters || {};
+    const width = queryParams.w ? parseInt(queryParams.w) : undefined;
+    const height = queryParams.h ? parseInt(queryParams.h) : undefined;
+    const quality = queryParams.q ? parseInt(queryParams.q) : undefined;
 
-    const transformedImage = await transformImage(imageData, request.params);
-
-    return {
-      statusCode: 200,
-      headers: {
-        'Content-Type': `image/${request.params.format || 'jpeg'}`,
-        'Cache-Control': CONFIG.CACHE_TTL,
-      },
-      body: transformedImage.toString('base64'),
-      isBase64Encoded: true,
-    };
+    return { projectName, imagePath, width, height, quality };
   } catch (error) {
-    console.error('Error processing image:', error);
-    // Log the full error details
-    if (error instanceof Error) {
-      console.error('Error name:', error.name);
-      console.error('Error message:', error.message);
-      console.error('Error stack:', error.stack);
-    }
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ 
-        error: 'Error processing image',
-        details: error instanceof Error ? error.message : 'Unknown error'
-      }),
-    };
-  }
-};
-
-function parseRequest(event: any): ImageRequest | null {
-  if (!event.rawPath) return null;
-
-  const params: ImageParams = {};
-  if (event.queryStringParameters) {
-    const { width, height, quality, format } = event.queryStringParameters;
-    if (width) params.width = parseInt(width, 10);
-    if (height) params.height = parseInt(height, 10);
-    if (quality) params.quality = parseInt(quality, 10);
-    if (format) params.format = format.toLowerCase() as SupportedFormat;
-  }
-
-  return {
-    path: event.rawPath.slice(1), // Remove leading slash
-    params,
-  };
-}
-
-function extractProjectAndPath(path: string): { projectName: string | null; imagePath: string | null } {
-  const parts = path.split('/');
-  if (parts.length < 2) {
-    return { projectName: null, imagePath: null };
-  }
-
-  return {
-    projectName: parts[0],
-    imagePath: parts.slice(1).join('/'),
-  };
-}
-
-async function getImageFromS3(bucket: string, key: string): Promise<Buffer | null> {
-  try {
-    const command = new GetObjectCommand({
-      Bucket: bucket,
-      Key: key,
-    });
-
-    const response = await s3Client.send(command);
-    if (!response.Body) return null;
-
-    return Buffer.from(await response.Body.transformToByteArray());
-  } catch (error) {
-    console.error('Error fetching image from S3:', error);
+    console.error('Error parsing request:', error);
     return null;
   }
 }
 
-async function transformImage(buffer: Buffer, params: ImageParams): Promise<Buffer> {
-  let image = sharp(buffer);
-
-  // Resize if width or height is specified
-  if (params.width || params.height) {
-    image = image.resize(params.width, params.height, {
-      fit: 'inside',
-      withoutEnlargement: true,
-    });
+async function getImageFromS3(bucket: string, key: string): Promise<Buffer | null> {
+  try {
+    const response = await s3Client.send(new GetObjectCommand({
+      Bucket: bucket,
+      Key: key,
+    }));
+    
+    if (!response.Body) return null;
+    return Buffer.from(await response.Body.transformToByteArray());
+  } catch (error: any) {
+    // Handle specific S3 errors
+    if (error.name === 'NoSuchKey' || error.name === 'NotFound') {
+      return null;
+    }
+    if (error.name === 'NoSuchBucket') {
+      console.error(`Bucket not found: ${bucket}`);
+      throw new Error('STORAGE_CONFIG_ERROR');
+    }
+    if (error.name === 'AccessDenied') {
+      console.error(`Access denied to: ${bucket}/${key}`);
+      throw new Error('ACCESS_DENIED');
+    }
+    console.error('S3 error:', error);
+    throw error;
   }
+}
 
-  // Convert format if specified and supported
-  const format = params.format && CONFIG.SUPPORTED_FORMATS.includes(params.format as SupportedFormat)
-    ? params.format
-    : 'jpeg';
+async function optimizeImage(imageBuffer: Buffer, width?: number, height?: number, quality?: number): Promise<Buffer> {
+  try {
+    let transform = sharp(imageBuffer);
+    
+    // Get image metadata
+    const metadata = await transform.metadata();
+    
+    // Validate image type
+    if (!metadata.format || !['jpeg', 'png', 'webp', 'gif'].includes(metadata.format)) {
+      throw new Error('UNSUPPORTED_FORMAT');
+    }
 
-  // Set quality for lossy formats
-  const quality = params.quality || CONFIG.DEFAULT_QUALITY;
+    // Resize if dimensions provided
+    if (width || height) {
+      transform = transform.resize(width, height, {
+        fit: 'inside',
+        withoutEnlargement: true
+      });
+    }
 
-  // Apply format and quality
-  switch (format) {
-    case 'jpeg':
-      image = image.jpeg({ quality });
-      break;
-    case 'webp':
-      image = image.webp({ quality });
-      break;
-    case 'avif':
-      image = image.avif({ quality });
-      break;
-    case 'png':
-      image = image.png();
-      break;
+    // Set quality (default to 80 if not specified)
+    const outputQuality = quality || 80;
+    if (outputQuality < 1 || outputQuality > 100) {
+      throw new Error('INVALID_QUALITY');
+    }
+
+    // Convert to appropriate format with quality setting
+    switch (metadata.format) {
+      case 'jpeg':
+        return await transform.jpeg({ quality: outputQuality }).toBuffer();
+      case 'png':
+        return await transform.png({ quality: outputQuality }).toBuffer();
+      case 'webp':
+        return await transform.webp({ quality: outputQuality }).toBuffer();
+      case 'gif':
+        return await transform.gif().toBuffer();
+      default:
+        throw new Error('UNSUPPORTED_FORMAT');
+    }
+  } catch (error: any) {
+    if (error.message === 'UNSUPPORTED_FORMAT' || error.message === 'INVALID_QUALITY') {
+      throw error;
+    }
+    console.error('Image optimization error:', error);
+    throw new Error('OPTIMIZATION_FAILED');
   }
+}
 
-  return image.toBuffer();
-} 
+export const handler = async (event: any) => {
+  try {
+    // Validate origin
+    const headers = event.headers || {};
+    if (headers['x-origin-verify'] !== 'cloudfront') {
+      return {
+        statusCode: 403,
+        body: JSON.stringify({ error: 'Access denied' })
+      };
+    }
+
+    // Parse request
+    const requestInfo = parseRequest(event);
+    if (!requestInfo) {
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ error: 'Invalid request format' })
+      };
+    }
+
+    const { projectName, imagePath, width, height, quality } = requestInfo;
+
+    // Validate project
+    const bucket = PROJECT_BUCKETS[projectName as keyof typeof PROJECT_BUCKETS];
+    if (!bucket) {
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ error: 'Project not found' })
+      };
+    }
+
+    // Get image from S3
+    const imageBuffer = await getImageFromS3(bucket, imagePath);
+    if (!imageBuffer) {
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ error: 'Image not found' })
+      };
+    }
+
+    // Optimize image
+    const optimizedImage = await optimizeImage(imageBuffer, width, height, quality);
+
+    // Return optimized image
+    return {
+      statusCode: 200,
+      headers: {
+        'Content-Type': 'image/jpeg',
+        'Cache-Control': process.env.transformedImageCacheTTL || 'public, max-age=31536000'
+      },
+      body: optimizedImage.toString('base64'),
+      isBase64Encoded: true
+    };
+
+  } catch (error: any) {
+    console.error('Error processing request:', error);
+
+    // Handle known error types
+    switch (error.message) {
+      case 'STORAGE_CONFIG_ERROR':
+        return {
+          statusCode: 503,
+          body: JSON.stringify({ error: 'Storage configuration error' })
+        };
+      case 'ACCESS_DENIED':
+        return {
+          statusCode: 403,
+          body: JSON.stringify({ error: 'Access denied to image storage' })
+        };
+      case 'UNSUPPORTED_FORMAT':
+        return {
+          statusCode: 415,
+          body: JSON.stringify({ error: 'Unsupported image format' })
+        };
+      case 'INVALID_QUALITY':
+        return {
+          statusCode: 400,
+          body: JSON.stringify({ error: 'Invalid quality parameter (must be between 1 and 100)' })
+        };
+      case 'OPTIMIZATION_FAILED':
+        return {
+          statusCode: 500,
+          body: JSON.stringify({ error: 'Failed to optimize image' })
+        };
+      default:
+        return {
+          statusCode: 500,
+          body: JSON.stringify({ error: 'Internal server error' })
+        };
+    }
+  }
+}; 

@@ -61,31 +61,10 @@ export class ImgTransformationStack extends cdk.Stack {
     };
 
     // Create Lambda function for image transformation
-    const imageFunction = new NodejsFunction(this, 'ImageFunction', {
+    const imageFunction = new lambda.Function(this, 'ImageFunction', {
       ...lambdaProps,
-      entry: 'functions/image-optimization/index.ts',
-      bundling: {
-        minify: true,
-        sourceMap: true,
-        externalModules: ['sharp'],
-        nodeModules: ['sharp'],
-        forceDockerBundling: true,
-        commandHooks: {
-          beforeBundling: (inputDir: string, outputDir: string) => {
-            return [
-              `mkdir -p ${inputDir}/functions/image-optimization/config`,
-              `cp ${inputDir}/config/projects.ts ${inputDir}/functions/image-optimization/config/`,
-              `cd ${outputDir} && npm install --platform=linux --arch=x64 sharp`
-            ];
-          },
-          beforeInstall: () => [],
-          afterBundling: (inputDir: string, outputDir: string) => {
-            return [
-              `rm -rf ${inputDir}/functions/image-optimization/config`,
-            ];
-          },
-        },
-      },
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('functions/image-optimization/dist'),
     });
 
     // Create Lambda function URL for image transformation
@@ -102,7 +81,7 @@ export class ImgTransformationStack extends cdk.Stack {
     const videoFunction = new lambda.Function(this, 'VideoFunction', {
       ...lambdaProps,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset('functions/video-thumbnail'),
+      code: lambda.Code.fromAsset('functions/video-thumbnail/dist'),
       layers: [
         lambda.LayerVersion.fromLayerVersionArn(this, 'FFmpegLayer',
           'arn:aws:lambda:us-east-1:656044625343:layer:ffmpeg:1'
@@ -168,7 +147,7 @@ export class ImgTransformationStack extends cdk.Stack {
             'x-origin-verify': 'cloudfront',
           },
         }),
-      viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
         functionAssociations: [
@@ -182,7 +161,7 @@ export class ImgTransformationStack extends cdk.Stack {
                 }
               `),
             }),
-        eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+            eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
           },
         ],
       },
@@ -192,62 +171,5 @@ export class ImgTransformationStack extends cdk.Stack {
       comment: 'Geerly Image Distribution',
     });
 
-    // Grant Lambda functions access to S3 buckets
-    const bucketNames = Object.values(PROJECT_BUCKETS) as string[];
-    bucketNames.forEach(bucketName => {
-      const bucket = s3.Bucket.fromBucketName(this, `${bucketName}Bucket`, bucketName);
-      bucket.grantRead(imageFunction);
-      bucket.grantRead(videoFunction);
-      // Grant write access for thumbnails directory
-      videoFunction.addToRolePolicy(new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: ['s3:PutObject'],
-        resources: [bucket.arnForObjects('thumbnails/*')],
-      }));
-    });
-
-    thumbnailBucket.grantReadWrite(imageFunction);
-    thumbnailBucket.grantReadWrite(videoFunction);
-
-    // Stack outputs
-    new cdk.CfnOutput(this, 'ImageDeliveryDomain', {
-      value: imageDistribution.distributionDomainName,
-      description: 'Boiling Kettle Image Optimization Domain',
-    });
-
-    new cdk.CfnOutput(this, 'VideoThumbnailDomain', {
-      value: thumbnailDistribution.distributionDomainName,
-      description: 'Boiling Kettle Video Thumbnail Domain',
-    });
-
-    new cdk.CfnOutput(this, 'GeerlyImageDomain', {
-      value: geerlyImageDistribution.distributionDomainName,
-      description: 'Geerly Image Domain',
-    });
-
-    new cdk.CfnOutput(this, 'OriginalImagesS3Bucket', {
-      value: bucketNames[0],
-    });
-
-    new cdk.CfnOutput(this, 'ThumbnailBucketName', {
-      value: thumbnailBucket.bucketName,
-    });
-
-    new cdk.CfnOutput(this, 'ImageFunctionUrl', {
-      value: imageFunctionUrl.url,
-    });
-
-    new cdk.CfnOutput(this, 'VideoFunctionUrl', {
-      value: videoFunctionUrl.url,
-    });
-
-    // Domain outputs
-    new cdk.CfnOutput(this, 'ImageDomain', {
-      value: IMAGE_DOMAIN,
-    });
-
-    new cdk.CfnOutput(this, 'VideoDomain', {
-      value: VIDEO_DOMAIN,
-    });
   }
 }

@@ -12,7 +12,6 @@
   "scripts": {
     "prebuild": "mkdir -p config && cp ../../config/projects.ts config/",
     "build": "tsc",
-    "postbuild": "rm -rf config",
     "start": "node dist/index.js",
     "clean": "rm -rf dist node_modules config"
   }
