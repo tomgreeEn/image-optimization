@@ -1,6 +1,6 @@
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 //import sharp from 'sharp';
-import { PROJECT_BUCKETS, CONFIG } from './config/projects';
+import { PROJECT_BUCKETS } from './config/projects';
 const sharp = require('sharp');
 
 const s3Client = new S3Client({});
@@ -15,10 +15,11 @@ interface ParsedRequest {
 
 function parseRequest(event: any): ParsedRequest | null {
   try {
-    const path = event.pathParameters?.proxy || '';
+    const path = event.rawPath || '';
     if (!path) return null;
 
-    const parts = path.split('/');
+    // Remove leading slash and split path
+    const parts = path.slice(1).split('/');
     if (parts.length < 2) return null;
 
     const projectName = parts[0];
@@ -28,9 +29,9 @@ function parseRequest(event: any): ParsedRequest | null {
 
     // Parse query parameters
     const queryParams = event.queryStringParameters || {};
-    const width = queryParams.w ? parseInt(queryParams.w) : undefined;
-    const height = queryParams.h ? parseInt(queryParams.h) : undefined;
-    const quality = queryParams.q ? parseInt(queryParams.q) : undefined;
+    const width = queryParams.width ? parseInt(queryParams.width) : undefined;
+    const height = queryParams.height ? parseInt(queryParams.height) : undefined;
+    const quality = queryParams.quality ? parseInt(queryParams.quality) : undefined;
 
     return { projectName, imagePath, width, height, quality };
   } catch (error) {
@@ -128,6 +129,7 @@ export const handler = async (event: any) => {
     // Parse request
     const requestInfo = parseRequest(event);
     if (!requestInfo) {
+      console.error("No request info from parseRequest | Event:", event)
       return {
         statusCode: 400,
         body: JSON.stringify({ error: 'Invalid request format' })

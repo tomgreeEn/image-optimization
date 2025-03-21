@@ -7,5 +7,3 @@ cp ../../config/projects.ts config/
 # Build TypeScript
 npm run build
 
-# Clean up
-rm -rf config 
